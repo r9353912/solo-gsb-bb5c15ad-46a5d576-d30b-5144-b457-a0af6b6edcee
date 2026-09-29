@@ -1,0 +1,23 @@
+services:
+  audit-desk:
+    build: .
+    image: event-evidence-audit:latest
+    container_name: event-evidence-audit
+    ports:
+      - "8000:8000"
+    environment:
+      DATA_DIR: /data
+      DB_PATH: /data/audit.db
+      # 首次启动且库为空时载入内置示例案件（生产环境置 0）
+      LOAD_SAMPLE: "1"
+    volumes:
+      - audit-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/api/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  audit-data:

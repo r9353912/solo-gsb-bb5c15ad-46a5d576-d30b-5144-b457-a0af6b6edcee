@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>事件证据链审计台</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">⏱</span>
+    <div>
+      <h1>事件证据链审计台</h1>
+      <p class="subtitle">多来源时钟偏差校正 · 约束传播 · 可解释冲突链重建</p>
+    </div>
+  </div>
+  <div class="top-actions">
+    <label class="btn primary" id="import-label">
+      <input type="file" id="file-input" accept=".json,application/json" hidden>
+      ＋ 导入 JSON
+    </label>
+    <button class="btn" id="btn-feasibility">🧭 全局时序可行性</button>
+    <button class="btn" id="btn-elapsed">⏳ 耗时审计</button>
+    <button class="btn" id="btn-reconcile">🔗 双来源对账</button>
+    <button class="btn" id="btn-compare">⚖ 方案对比</button>
+    <button class="btn" id="btn-sensitivity">📈 偏移敏感性</button>
+    <button class="btn" id="btn-export">⬇ 导出审计结果</button>
+    <button class="btn ghost danger" id="btn-reset" title="清空全部数据与假设">清空数据</button>
+  </div>
+</header>
+
+<div id="drop-hint" class="drop-hint hidden">松开即可导入 JSON 文件</div>
+
+<main class="layout">
+
+  <!-- 左：来源与时钟假设 -->
+  <aside class="panel col-sources">
+    <div class="panel-head">
+      <h2>来源时钟假设</h2>
+      <span class="hint">改值后点“即时重算”</span>
+    </div>
+    <div id="sources" class="sources"></div>
+    <div class="panel-foot">
+      <button class="btn primary" id="btn-recompute">⟳ 即时重算</button>
+      <button class="btn" id="btn-save">💾 保存假设</button>
+      <button class="btn ghost" id="btn-discard">放弃调整</button>
+    </div>
+  </aside>
+
+  <!-- 中：时间线 -->
+  <section class="panel col-timeline">
+    <div class="panel-head wrap">
+      <h2>重建时间线</h2>
+      <button class="btn tiny" id="btn-feasibility-2"
+        title="全部事件区间 × 全部有效约束联立求解（含未保存调整，不受筛选影响）">🧭 全局时序可行性</button>
+      <div class="stats" id="stats"></div>
+    </div>
+
+    <div class="filters">
+      <input type="search" id="f-q" placeholder="搜索摘要 / ID / 操作者…">
+      <select id="f-source"><option value="">全部来源</option></select>
+      <select id="f-type"><option value="">全部类型</option></select>
+      <label class="chk"><input type="checkbox" id="f-conflicts"> 仅冲突链</label>
+      <label class="chk"><input type="checkbox" id="f-ambiguous"> 仅时间歧义</label>
+      <button class="btn tiny ghost" id="f-clear">清除筛选</button>
+    </div>
+
+    <div class="scale-row">
+      <span id="scale-lo" class="scale-label"></span>
+      <div class="scale-track"><span>◄ 真实时间区间（置信区间）与估计时刻 ─►</span></div>
+      <span id="scale-hi" class="scale-label"></span>
+    </div>
+
+    <div id="timeline" class="timeline"></div>
+  </section>
+
+  <!-- 右：冲突与约束 -->
+  <aside class="panel col-findings">
+    <div class="panel-head">
+      <h2>冲突定位</h2>
+      <span class="badge danger" id="conflict-count">0</span>
+    </div>
+    <div id="conflicts" class="conflicts"></div>
+
+    <div class="panel-head sub">
+      <h3>时间歧义</h3>
+      <span class="badge warn" id="ambig-count">0</span>
+    </div>
+    <div id="ambiguities" class="ambiguities"></div>
+
+    <div class="panel-head sub">
+      <h3>顺序约束（<span id="edge-count">0</span>）</h3>
+    </div>
+    <div id="edges" class="edges"></div>
+  </aside>
+</main>
+
+<div id="toast" class="toast hidden"></div>
+
+<!-- 假设方案对比抽屉 -->
+<div id="compare-overlay" class="overlay hidden" aria-hidden="true">
+  <div class="overlay-card">
+    <div class="overlay-head">
+      <h2>⚖ 假设方案对比</h2>
+      <p class="subtitle">把当前来源时钟偏差 / 不确定度 / 可靠度保存为命名方案，选择两套方案对同一批事件分别重算。</p>
+      <div class="overlay-actions">
+        <button class="btn tiny primary" id="cmp-save-current">💾 保存当前假设为方案</button>
+        <button class="btn tiny" id="cmp-export" title="导出对比结果 JSON">⬇ 导出对比 JSON</button>
+        <button class="btn tiny ghost" id="cmp-close">✕ 关闭</button>
+      </div>
+    </div>
+
+    <div class="cmp-toolbar">
+      <div class="cmp-side-sel">
+        <span class="cmp-side-tag a">方案 A（基线）</span>
+        <select id="cmp-side-a"></select>
+      </div>
+      <button class="btn tiny ghost" id="cmp-swap" title="交换 A / B">⇄</button>
+      <div class="cmp-side-sel">
+        <span class="cmp-side-tag b">方案 B（对比）</span>
+        <select id="cmp-side-b"></select>
+      </div>
+      <button class="btn tiny primary" id="cmp-run">▶ 对比重算</button>
+      <span id="cmp-hint" class="cmp-hint"></span>
+    </div>
+
+    <div id="cmp-scenarios" class="cmp-scenarios"></div>
+    <div id="cmp-result" class="cmp-result"></div>
+  </div>
+</div>
+
+<!-- 偏移敏感性抽屉 -->
+<div id="sens-overlay" class="overlay hidden" aria-hidden="true">
+  <div class="overlay-card">
+    <div class="overlay-head">
+      <h2>📈 偏移敏感性扫描</h2>
+      <p class="subtitle">选定来源并输入 offset 扫描上下界：后端按该来源参与的约束边解析 gap 穿越 0 的临界点，
+        把范围切成边状态稳定的连续区间，逐段重算并给出不可能边 / 冲突链相对当前结果的新增与消失。</p>
+      <div class="overlay-actions">
+        <button class="btn tiny ghost" id="sens-close">✕ 关闭</button>
+      </div>
+    </div>
+
+    <div class="cmp-toolbar">
+      <div class="cmp-side-sel">
+        <span class="cmp-side-tag a">扫描来源</span>
+        <select id="sens-source"></select>
+      </div>
+      <div class="sens-range">
+        <label>下界 <input type="number" id="sens-lo" step="any"></label>
+        <label>上界 <input type="number" id="sens-hi" step="any"></label>
+      </div>
+      <button class="btn tiny primary" id="sens-run">▶ 扫描</button>
+      <span id="sens-hint" class="cmp-hint"></span>
+    </div>
+
+    <div id="sens-result" class="cmp-result"></div>
+  </div>
+</div>
+
+<!-- 全局时序可行性抽屉 -->
+<div id="feas-overlay" class="overlay hidden" aria-hidden="true">
+  <div class="overlay-card">
+    <div class="overlay-head">
+      <h2>🧭 全局时序可行性检查</h2>
+      <p class="subtitle">以当前（含未保存调整）的时钟假设，把<b>全部事件</b>的真实时间区间与<b>全部有效约束</b>联立求解：
+        每个事件取闭区间内一个时刻，边 a→b 要求 t_b ≥ t_a（环允许同刻，但环内区间必须有公共交集）。
+        不受页面筛选影响，只读检查，不改写任何事件或假设。
+        无解时可继续搜索<b>约束撤销建议</b>：需撤销的最少人工/导入约束（预览，不写库）。</p>
+      <div class="overlay-actions">
+        <button class="btn tiny primary" id="feas-rerun">⟳ 重新检查</button>
+        <button class="btn tiny ghost" id="feas-close">✕ 关闭</button>
+      </div>
+    </div>
+    <div id="feas-result" class="cmp-result"></div>
+  </div>
+</div>
+
+<!-- 两事件耗时精确界审计抽屉 -->
+<div id="elapsed-overlay" class="overlay hidden" aria-hidden="true">
+  <div class="overlay-card">
+    <div class="overlay-head">
+      <h2>⏳ 两事件耗时审计</h2>
+      <p class="subtitle">选择<b>起点事件</b>、<b>终点事件</b>与非负有限的<b>耗时阈值（秒）</b>，
+        后端复用现有时间闭区间与<b>全部有效先后约束</b>（含 source_order，允许同刻），在所有可行时间分配中求
+        <b>终点时刻 − 起点时刻</b>的精确最小 / 最大值（可为负），分别给出达到端点的<b>全量事件时刻见证</b>——
+        不是两事件各自区间直接相减。<b>最小 &gt; 阈值</b>判必超，<b>最大 ≤ 阈值</b>判必不超，其余为可能超。
+        计算携带左栏<b>未保存</b>假设、不受页面筛选影响，只读不保存假设或改写数据。
+        全局无解时展示现有矛盾见证，不输出耗时结论。</p>
+      <div class="overlay-actions">
+        <button class="btn tiny primary" id="elapsed-run">▶ 计算</button>
+        <button class="btn tiny ghost" id="elapsed-close">✕ 关闭</button>
+      </div>
+    </div>
+
+    <div class="cmp-toolbar">
+      <div class="cmp-side-sel">
+        <span class="cmp-side-tag a">起点事件</span>
+        <select id="elapsed-start"></select>
+      </div>
+      <span class="elapsed-arrow">→</span>
+      <div class="cmp-side-sel">
+        <span class="cmp-side-tag b">终点事件</span>
+        <select id="elapsed-end"></select>
+      </div>
+      <div class="sens-range">
+        <label>阈值(s) <input type="number" id="elapsed-threshold" min="0" step="any" value="0"></label>
+      </div>
+      <span id="elapsed-hint" class="cmp-hint"></span>
+    </div>
+
+    <div id="elapsed-result" class="cmp-result"></div>
+  </div>
+</div>
+
+<!-- 双来源事件对账抽屉 -->
+<div id="recon-overlay" class="overlay hidden" aria-hidden="true">
+  <div class="overlay-card">
+    <div class="overlay-head">
+      <h2>🔗 双来源事件对账</h2>
+      <p class="subtitle">选择两个<b>不同来源</b>与非负容差（毫秒），复用当前时钟校正区间（含左栏<b>未保存</b>调整）做只读对账：
+        仅 <b>actor 非空且相同、事件类型相同、两侧闭区间间距不超过容差</b>（时间量统一四舍五入到整数毫秒）的事件可配对；
+        每条事件最多参与一对，<b>先最大化配对数，再最小化区间中点差绝对值之和</b>（全局最优，非逐条贪心），同优按事件 ID 稳定输出。
+        每侧最多 200 条事件。不新增约束、不合并记录；调整假设后可重新对账。点击任意事件 ID 回到主时间线定位。
+        配对结果中可勾选 1～20 对确认同一动作的事件做 <b>🎯 锚点校准</b>：固定漂移与不确定度，反推待校准来源的可行 offset 范围，
+        "采用中点"只写入左栏未保存假设并重算时间线，仍可放弃调整。</p>
+      <div class="overlay-actions">
+        <button class="btn tiny primary" id="recon-rerun">⟳ 重新对账</button>
+        <button class="btn tiny ghost" id="recon-close">✕ 关闭</button>
+      </div>
+    </div>
+
+    <div class="cmp-toolbar">
+      <div class="cmp-side-sel">
+        <span class="cmp-side-tag a">来源 A</span>
+        <select id="recon-source-a"></select>
+      </div>
+      <div class="cmp-side-sel">
+        <span class="cmp-side-tag b">来源 B</span>
+        <select id="recon-source-b"></select>
+      </div>
+      <div class="sens-range">
+        <label>容差(ms) <input type="number" id="recon-tol" min="0" step="1" value="1000"></label>
+      </div>
+      <button class="btn tiny primary" id="recon-run">▶ 开始对账</button>
+      <span id="recon-hint" class="cmp-hint"></span>
+    </div>
+
+    <div id="recon-result" class="cmp-result"></div>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+<script src="/static/compare.js"></script>
+<script src="/static/sensitivity.js"></script>
+<script src="/static/feasibility.js"></script>
+<script src="/static/retraction.js"></script>
+<script src="/static/reconciliation.js"></script>
+<script src="/static/elapsed.js"></script>
+</body>
+</html>
