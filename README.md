@@ -45,6 +45,14 @@
     判"必超"，**最大 ≤ 阈值**判"必不超"，其余为"可能超"。全局无解时展示现有矛盾
     见证、不输出耗时结论；起终点未知或相同、阈值非法一律明确拒绝。携带页面未保存
     假设、不受筛选影响、只读不写库。
+12. **导入批次查看与确认撤回**：每次 JSON 导入形成一个**批次**，台账只登记该批次
+    **实际写入**的来源、事件与声明约束。审计员可在右上 **🗂 导入批次** 抽屉按批次
+    查看新增记录（逐项标注当前是否仍存在），确认后撤回：只删除该批次写入**且仍存在**
+    的记录、保留导入前数据，移除批次产生的约束并**按受影响来源重建 source_order
+    时序边**（其它来源的边不动），返回**删除 / 保留 / 悬空**统计。重复导入未写入的
+    ID 不进台账、绝不会被误删；批次**不存在、已撤回，或包含无法安全判断归属的
+    记录**（批次来源下残留无批次归属的导入前 / 手工事件；或删除批次事件会级联删掉
+    非本批次的声明约束）时**拒绝撤回并逐条说明原因**，要求审计员先手工处理。
 
 ---
 
@@ -81,6 +89,7 @@ python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 ```bash
 python tests/test_engine.py      # 纯标准库，覆盖时间解析 / 冲突 / 因果环 / 假设调整全流程
+python tests/test_batches.py     # 纯标准库，覆盖导入批次：台账只记实际写入 / 重复 ID 撤回不删 / 导入前数据保留 / 无归属事件与外来约束拒绝 / 已撤回·不存在拒绝 / 悬空统计 / source_order 重建不波及他人来源
 python tests/test_scenarios.py   # 纯标准库，覆盖方案快照 CRUD / 对比差异（冲突/歧义/边/时间线逆序对）
 python tests/test_sensitivity.py # 纯标准库，覆盖偏移敏感性：临界点解析 / offset 抵消 / 区间差异 / 输入校验
 python tests/test_feasibility.py # 纯标准库，覆盖全局时序可行性：DAG 传播 / 环交集 / 矛盾路径 / 5000 事件无递归
@@ -323,7 +332,10 @@ python tests/test_elapsed_time.py      # 纯标准库，覆盖两事件耗时审
 
 - 事件中出现但未在 `sources` 声明的来源会**自动登记**（offset=0、uncertainty=1），等待审计员校正；
 - 同一来源内事件自动生成 `source_order` 严格时序边（本地时钟单调）；
-- 重复导入按事件 `id` **幂等**，且不会覆盖审计员已调整的来源假设；
+- 重复导入按事件 `id` **幂等**，且不会覆盖审计员已调整的来源假设；重复 ID 不写入、
+  记入该批次摘要 `duplicate_event_ids`，撤回批次时不会误删；
+- 每次导入形成一个**批次**，只有实际新写入的来源 / 事件 / 声明约束进入批次台账，
+  可在「🗂 导入批次」查看并确认撤回（见上文功能 12）；
 - 无法解析的时间戳不会静默入库，会在导入结果 `rejected` 中逐条说明；
 - 约束端点不存在时导入成功但产生告警；单文件上限 8 MB、单次上限 5000 事件。
 
@@ -408,6 +420,11 @@ gap ∈ [ lo_b - hi_a ,  hi_b - lo_a ]
   分别给出达到端点的全量事件时刻见证（分批渲染、可点击定位），附朴素两区间差对照与
   起终点约束路径方向说明；全局无解时展示矛盾见证、不给耗时结论；事件未知 / 相同 /
   阈值非法明确拒绝；只读，不保存假设或改写数据。
+- **导入批次与确认撤回**（右上 🗂）：每次 JSON 导入形成一个批次，列表展示各批次新增的
+  来源 / 事件 / 约束数量与重复 ID；点开批次可逐项查看新增记录及当前是否仍存在，并展示
+  撤回预案（删除 / 保留 / 悬空统计、受影响 source_order 来源）；安全时给出红色确认按钮，
+  不安全时红色区块逐条列出拒绝原因（批次来源残留无批次事件、外来约束会被级联删除等），
+  已撤回批次只保留只读台账。撤回后自动刷新主时间线。
 
 ---
 
@@ -416,7 +433,10 @@ gap ∈ [ lo_b - hi_a ,  hi_b - lo_a ]
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | POST | `/api/import` | multipart 上传 JSON 文件 |
-| POST | `/api/import/raw` | 直接提交 JSON（便于 curl / 集成） |
+| POST | `/api/import/raw` | 直接提交 JSON（便于 curl / 集成）；返回 `summary.batch_id` |
+| GET | `/api/batches` | 导入批次列表（最新在前，含状态与台账记录数） |
+| GET | `/api/batches/{id}` | 批次详情：实际新增的来源 / 事件 / 约束，逐项标注是否仍存在 |
+| POST | `/api/batches/{id}/retract` | 撤回预案 / 确认撤回；body `{"confirm": false}` 只回安全预案与统计，`{"confirm": true}` 执行；不存在 404、已撤回 / 归属不安全 409 |
 | POST | `/api/recompute` | 应用临时假设 + 筛选条件，返回完整推理结果 |
 | POST | `/api/sources/assumptions` | 持久化审计员确认的偏差假设 |
 | GET | `/api/sources` | 来源列表（含生效值 / 已存值 / dirty 标记） |
@@ -846,6 +866,51 @@ curl -X POST http://localhost:8000/api/elapsed-time-bounds \
   -d '{"start_event":"g1","end_event":"a3","threshold_seconds":60}'
 ```
 
+### 导入批次查看与确认撤回（🗂）
+
+页面右上 **🗂 导入批次**（API：`GET /api/batches`、`GET /api/batches/{id}`、
+`POST /api/batches/{id}/retract`）。每次 `/api/import`（含示例自动载入）都形成一个
+批次，`import` 响应的 `summary.batch_id` 即批次号。
+
+撤回分两步，避免误操作：
+
+1. `POST /api/batches/{id}/retract`，body `{"confirm": false}` 只返回**撤回预案**
+   （`action:"preview"`，不写库）：
+   - `delete`：经安全校验后将删除的来源 / 事件 / 声明约束（**仅本批次实际写入且仍
+     存在**的记录）；
+   - `retained`：保留项——仍有其它事件而保留的来源（`unclaimed_sources` 标出导入前
+     已存在的来源）、归属其它活跃批次的事件、引用批次事件的外来约束；
+   - `dangling`：批次台账里**撤回前已不存在**的记录（只统计、不删除）；
+   - `affected_source_order_sources`：撤回后需要重建 `source_order` 边的来源；
+   - `stats.deleted / retained / dangling`：三类记录计数；
+   - `safe=false` 时 `blockers` 逐条列出拒绝原因。
+2. 页面确认或 `{"confirm": true}` 才执行：删除批次写入的声明约束与事件、清空后
+   删除批次登记的来源，按受影响来源**整源重建** source_order 边（其它来源不动），
+   批次状态置为 `retracted`（台账保留以便审计），返回同形态统计。
+
+**拒绝撤回的情形**（404 / 409，消息逐条说明）：
+
+- 批次不存在（404）；批次已撤回（409，不能重复撤回）；
+- `blockers[].reason="unowned_event"`：批次来源下仍残留**不属于任何批次**的事件
+  （导入前数据或手工录入），删来源会误删，需先手工处理；
+- `blockers[].reason="foreign_constraint"`：删除批次事件会级联删掉**非本批次**
+  写入的声明约束（审计员手工或别的批次建立），需先手工删除该约束。
+  `source_order` 边是派生物、不在此列（撤回后统一重建）。
+
+**重复导入幂等**：重复 ID 本次根本未写入，只记录在批次摘要
+`summary.duplicate_event_ids`，不进台账，撤回时不可能误删；重复的声明约束同理。
+
+```bash
+curl -X POST http://localhost:8000/api/import/raw -H 'Content-Type: application/json' \
+  -d '{"events":[{"id":"e1","source":"s","time":"2026-01-01T00:00:00Z"}]}'
+# -> {"summary": {"batch_id": 1, ...}}
+curl http://localhost:8000/api/batches
+curl -X POST http://localhost:8000/api/batches/1/retract \
+  -H 'Content-Type: application/json' -d '{"confirm": false}'   # 预案
+curl -X POST http://localhost:8000/api/batches/1/retract \
+  -H 'Content-Type: application/json' -d '{"confirm": true}'    # 确认撤回
+```
+
 交互式文档：启动后访问 `http://localhost:8000/docs`。
 
 ---
@@ -862,15 +927,17 @@ curl -X POST http://localhost:8000/api/elapsed-time-bounds \
 │   ├── reconciliation.py # 双来源事件对账：复用校正区间，整数毫秒四舍五入，Kuhn+匈牙利全局最优一一配对（反贪心/稳定输出/每侧200）
 │   ├── anchor_calibration.py # 锚点校准：1～20 对锚点逐对求闭区间相交的 offset 增量范围并取交集，冲突锚点定位，绝对 offset/中点（只读）
 │   ├── elapsed_time.py     # 两事件耗时审计：SCC 压缩 DAG 上分量最早/最晚 + 端点钉扎传播，求 t_end−t_start 精确 min/max 与全量见证（只读）
+│   ├── batches.py        # 导入批次台账：批次详情、撤回安全预案（归属判定/悬空统计）、确认撤回与 source_order 重建
 │   ├── scenarios.py     # 命名假设方案快照 CRUD、双方案重算差异（冲突/歧义/边/时间线/参数）
 │   ├── sensitivity.py   # 偏移敏感性：临界点解析求解、稳定区间切分、逐段重算与差异配对
-│   ├── importer.py      # 多别名宽松 JSON 规范化、幂等入库、来源时序边重建
-│   ├── db.py            # SQLite 连接、建表初始化（含 scenarios 表）
+│   ├── importer.py      # 多别名宽松 JSON 规范化、幂等入库、批次台账登记、来源时序边重建
+│   ├── db.py            # SQLite 连接、建表初始化（含 scenarios / import_batches 批次台账表）
 │   ├── timeutil.py      # 多格式时间戳解析（秒/毫秒/微秒/纳秒、ISO、RFC2822）
 │   ├── sample.py        # 内置示例案件
-│   └── static/          # 原生前端 index.html / style.css / app.js / compare.js / sensitivity.js / feasibility.js / retraction.js / reconciliation.js / elapsed.js
+│   └── static/          # 原生前端 index.html / style.css / app.js / batches.js / compare.js / sensitivity.js / feasibility.js / retraction.js / reconciliation.js / elapsed.js
 ├── examples/login-anomaly.json
 ├── tests/test_engine.py      # 纯标准库测试（11 项）
+├── tests/test_batches.py     # 导入批次撤回测试（17 项：台账只记实际写入/重复 ID 不删/导入前数据保留/无归属事件与外来约束拒绝/已撤回与不存在拒绝/悬空统计/source_order 重建不波及他人）
 ├── tests/test_scenarios.py   # 方案快照与双方案对比测试（12 项）
 ├── tests/test_sensitivity.py # 偏移敏感性扫描测试（9 项）
 ├── tests/test_feasibility.py # 全局时序可行性测试（11 项，含 5000 事件规模与深环无递归）

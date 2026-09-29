@@ -98,6 +98,37 @@ CREATE TABLE IF NOT EXISTS scenarios (
     created_at   TEXT NOT NULL,
     updated_at   TEXT NOT NULL
 );
+
+-- 每次 JSON 导入形成一个“批次”：撤回只删除该批次实际写入（且仍存在）的记录。
+-- source_order 时序边是按来源全量派生的，不属于任何批次，撤回后重建。
+CREATE TABLE IF NOT EXISTS import_batches (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    label       TEXT NOT NULL DEFAULT '',    -- 来源标识（文件名等，可省）
+    status      TEXT NOT NULL DEFAULT 'active', -- active | retracted
+    summary     TEXT NOT NULL DEFAULT '{}',  -- 导入结果摘要（含未写入的重复 ID）
+    created_at  TEXT NOT NULL,
+    retracted_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS batch_sources (
+    batch_id   INTEGER NOT NULL REFERENCES import_batches(id) ON DELETE CASCADE,
+    source_id  TEXT NOT NULL,
+    PRIMARY KEY (batch_id, source_id)
+);
+
+CREATE TABLE IF NOT EXISTS batch_events (
+    batch_id   INTEGER NOT NULL REFERENCES import_batches(id) ON DELETE CASCADE,
+    event_id   TEXT NOT NULL,
+    PRIMARY KEY (batch_id, event_id)
+);
+CREATE INDEX IF NOT EXISTS idx_batch_events_event ON batch_events(event_id);
+
+CREATE TABLE IF NOT EXISTS batch_constraints (
+    batch_id   INTEGER NOT NULL REFERENCES import_batches(id) ON DELETE CASCADE,
+    constraint_id INTEGER NOT NULL,
+    PRIMARY KEY (batch_id, constraint_id)
+);
+CREATE INDEX IF NOT EXISTS idx_batch_constraints_constraint ON batch_constraints(constraint_id);
 """
 
 

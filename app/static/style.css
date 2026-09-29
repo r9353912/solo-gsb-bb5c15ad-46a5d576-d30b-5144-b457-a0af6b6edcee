@@ -744,3 +744,53 @@ body {
 .elapsed-ep-delta { margin-left: auto; font-size: 12px; }
 .elapsed-ep-delta b { font-family: var(--mono); font-size: 13px; color: #f0c273; }
 .feas-row.is-endpoint { outline: 1px solid #3a5a86; }
+
+/* ------------------------------------------------ 导入批次抽屉 */
+.b-list { display: flex; flex-direction: column; gap: 8px; }
+.b-row {
+  background: var(--bg); border: 1px solid var(--line); border-radius: 10px;
+  padding: 10px 14px; cursor: pointer; display: flex; flex-direction: column; gap: 6px;
+}
+.b-row:hover { border-color: var(--primary); }
+.b-row.retracted { opacity: .62; }
+.b-row-main { display: flex; align-items: center; gap: 10px; }
+.b-id { font-family: var(--mono); color: var(--primary); font-weight: 600; }
+.b-label { font-weight: 600; }
+.b-row-meta { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.b-st {
+  margin-left: auto; font-size: 11px; padding: 1px 10px; border-radius: 10px;
+  border: 1px solid var(--line); color: var(--muted);
+}
+.st-active { color: #8ce0b4; border-color: #2c5c44; background: rgba(57,192,122,.12); }
+.st-retracted { color: #ff9b94; border-color: #6b2f2c; background: rgba(229,83,75,.12); }
+
+.b-backbar { display: flex; }
+.b-head.retracted { border-color: #6b2f2c; }
+.b-recs { display: flex; flex-direction: column; gap: 5px; }
+.b-rec {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  background: var(--bg-2); border: 1px solid #222d3b; border-radius: 7px;
+  padding: 5px 10px; font-size: 12px;
+}
+.b-rec-name { color: var(--text); }
+.b-empty-rec { padding: 4px 2px; }
+.b-note {
+  font-size: 12px; color: var(--muted); background: var(--bg-2);
+  border: 1px solid #222d3b; border-left-width: 3px; border-radius: 6px;
+  padding: 6px 10px; margin-top: 6px;
+}
+.b-note b { color: var(--text); }
+.b-note.amb { border-left-color: var(--warn); }
+.b-note.conf { border-left-color: var(--danger); }
+.b-note.ok { border-left-color: var(--ok); }
+
+.b-stats { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+.b-actions { display: flex; align-items: center; gap: 12px; margin-top: 10px; }
+.b-actions .btn { margin-left: auto; }
+
+.b-blockers {
+  margin-top: 8px; border: 1px solid #6b2f2c; border-radius: 8px;
+  background: rgba(229,83,75,.08); padding: 10px 12px;
+}
+.b-blocker-head { color: #ff9b94; font-weight: 600; margin-bottom: 6px; }
+.b-blocker { font-size: 12px; color: #ffc4c0; margin: 3px 0; }

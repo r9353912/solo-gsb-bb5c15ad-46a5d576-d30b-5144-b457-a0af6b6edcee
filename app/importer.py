@@ -61,7 +61,8 @@ def _normalize_source(raw: dict) -> dict:
     }
 
 
-def _upsert_source(conn, s: dict, warnings: list[str]) -> None:
+def _upsert_source(conn, s: dict, warnings: list[str]) -> bool:
+    """插入或补名来源；返回是否为本次新写入（True=新登记，False=已存在）。"""
     row = conn.execute("SELECT id, name FROM sources WHERE id=?", (s["id"],)).fetchone()
     now = _now()
     if row is None:
@@ -71,11 +72,12 @@ def _upsert_source(conn, s: dict, warnings: list[str]) -> None:
             (s["id"], s["name"], s["clock_offset"], s["drift_ppm"], s["uncertainty"],
              s["reliability"], s["kind"], now, now),
         )
-    else:
-        # 已存在的来源（审计员可能已调整偏差假设）：不覆盖假设，只补名称。
-        if not row["name"] and s["name"]:
-            conn.execute("UPDATE sources SET name=?, updated_at=? WHERE id=?",
-                         (s["name"], now, s["id"]))
+        return True
+    # 已存在的来源（审计员可能已调整偏差假设）：不覆盖假设，只补名称。
+    if not row["name"] and s["name"]:
+        conn.execute("UPDATE sources SET name=?, updated_at=? WHERE id=?",
+                     (s["name"], now, s["id"]))
+    return False
 
 
 # ----------------------------------------------------------------- events
@@ -133,8 +135,13 @@ def _normalize_constraint(raw: dict) -> tuple[tuple | None, str | None]:
 
 # ------------------------------------------------------------------ 入口
 
-def import_payload(payload: Any) -> dict[str, Any]:
-    """导入一份 JSON 文档，返回 {sources_added, events_imported, rejected, warnings}。"""
+def import_payload(payload: Any, label: str = "") -> dict[str, Any]:
+    """导入一份 JSON 文档，返回 {sources_added, events_imported, rejected, warnings}。
+
+    每次导入形成一个“批次”（import_batches）：只有本次实际新写入的来源 /
+    事件 / 声明约束才记入批次台账；重复导入未写入的 ID 不进台账，撤回时
+    不会被误删。source_order 时序边为按来源全量派生数据，不计入批次。
+    """
     warnings: list[str] = []
     rejected: list[dict] = []
 
@@ -192,16 +199,30 @@ def import_payload(payload: Any) -> dict[str, Any]:
                 })
                 declared.add(ev["source_id"])
 
+        # 先开批次台账（与本次写入同一事务；整体失败则不留批次）。
+        cur = conn.execute(
+            "INSERT INTO import_batches(label, status, summary, created_at) "
+            "VALUES(?, 'active', '{}', ?)",
+            (str(label or ""), now))
+        batch_id = cur.lastrowid
+
         sources_added = 0
         for s in sources:
-            if s["id"] not in known_before:
+            created = _upsert_source(conn, s, warnings)
+            if s["id"] not in known_before and created:
                 sources_added += 1
-            _upsert_source(conn, s, warnings)
+            if created:
+                # 只有本批次实际新登记的来源才归属本批次；已存在来源不归属。
+                conn.execute(
+                    "INSERT OR IGNORE INTO batch_sources(batch_id, source_id) VALUES(?,?)",
+                    (batch_id, s["id"]))
 
         events_added = 0
+        duplicate_event_ids: list[str] = []
         for ev in events:
             if ev["id"] in known_events:
-                continue  # 幂等：重复导入不覆盖
+                duplicate_event_ids.append(ev["id"])  # 幂等：未写入，不进台账
+                continue
             conn.execute(
                 "INSERT INTO events(id,source_id,seq,local_ts,ts_text,event_type,actor,summary,raw,"
                 "imported_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
@@ -209,6 +230,9 @@ def import_payload(payload: Any) -> dict[str, Any]:
                  ev["event_type"], ev["actor"], ev["summary"],
                  json.dumps(ev["raw"], ensure_ascii=False), now),
             )
+            conn.execute(
+                "INSERT INTO batch_events(batch_id, event_id) VALUES(?,?)",
+                (batch_id, ev["id"]))
             events_added += 1
 
         # 重建“同来源时序边”：同来源事件天然按本地时钟严格有序。
@@ -226,40 +250,79 @@ def import_payload(payload: Any) -> dict[str, Any]:
             cur = conn.execute(
                 "INSERT OR IGNORE INTO constraints(from_event,to_event,kind,note,created_at) "
                 "VALUES(?,?,?,?,?)", (frm, to, kind, note, now))
-            constraints_added += cur.rowcount
+            if cur.rowcount:
+                # 只把本批次实际写入（非重复）的约束记入台账。
+                conn.execute(
+                    "INSERT INTO batch_constraints(batch_id, constraint_id) VALUES(?,?)",
+                    (batch_id, cur.lastrowid))
+                constraints_added += cur.rowcount
 
-    return {
-        "sources_total": len(sources),
-        "sources_added": sources_added,
-        "events_total": len(events),
-        "events_added": events_added,
-        "constraints_added": constraints_added,
-        "rejected": rejected,
-        "warnings": warnings,
-    }
+        summary = {
+            "sources_total": len(sources),
+            "sources_added": sources_added,
+            "events_total": len(events),
+            "events_added": events_added,
+            "constraints_added": constraints_added,
+            "rejected": rejected,
+            "warnings": warnings,
+            "duplicate_event_ids": duplicate_event_ids,
+        }
+        conn.execute("UPDATE import_batches SET summary=? WHERE id=?",
+                     (json.dumps(summary, ensure_ascii=False), batch_id))
+
+    return {**summary, "batch_id": batch_id}
 
 
-def _rebuild_source_edges(conn, now: str) -> None:
-    """为每个来源按 (seq 优先, 否则 local_ts) 生成严格时序边。"""
-    conn.execute("DELETE FROM constraints WHERE kind='source_order'")
-    rows = conn.execute("SELECT id, source_id, seq, local_ts FROM events").fetchall()
+def _rebuild_source_edges(conn, now: str, source_ids: set[str] | None = None) -> None:
+    """为每个来源按 (seq 优先, 否则 local_ts) 生成严格时序边。
+
+    source_ids 给定时只重建这些来源（撤回后修复受影响来源用）；
+    否则全量重建（导入时保持历史行为）。source_order 是派生物，
+    不属于任何批次。
+    """
+    if source_ids is not None:
+        if not source_ids:
+            return
+        marks = ",".join("?" for _ in source_ids)
+        # 整源重建：该来源全部时序边先删光（不能只删邻接被删事件的边——
+        # 幸存事件之间可能残留因中间事件删除而失效的旧边 a→c），再按现存
+        # 事件重新生成；其它来源的边一律不动。
+        conn.execute(
+            f"DELETE FROM constraints WHERE kind='source_order' "
+            f"AND from_event IN (SELECT id FROM events WHERE source_id IN ({marks}))",
+            tuple(source_ids))
+        rows = conn.execute(
+            f"SELECT id, source_id, seq, local_ts FROM events "
+            f"WHERE source_id IN ({marks}) ORDER BY id", tuple(source_ids)).fetchall()
+    else:
+        conn.execute("DELETE FROM constraints WHERE kind='source_order'")
+        rows = conn.execute(
+            "SELECT id, source_id, seq, local_ts FROM events ORDER BY id").fetchall()
     by_source: dict[str, list] = {}
     for r in rows:
         by_source.setdefault(r["source_id"], []).append(r)
     for evs in by_source.values():
-        evs.sort(key=lambda r: (r["seq"] if r["seq"] is not None else 1 << 62, r["local_ts"]))
-        for a, b in zip(evs, evs[1:]):
-            if a["local_ts"] == b["local_ts"]:
-                continue  # 同刻戳无法声明严格顺序
-            conn.execute(
-                "INSERT OR IGNORE INTO constraints(from_event,to_event,kind,note,created_at) "
-                "VALUES(?,?,?,?,?)",
-                (a["id"], b["id"], "source_order", "同一来源本地时钟严格有序", now),
-            )
+        evs.sort(key=lambda r: (r["seq"] if r["seq"] is not None else 1 << 62,
+                                r["local_ts"], r["id"]))
+        prev = None
+        for cur in evs:
+            # 同刻戳无法声明严格顺序：跳过该跳但不断链（prev 保留），
+            # 同时以 id 作稳定次序，保证导入 / 撤回重建结果确定。
+            if prev is not None and prev["local_ts"] != cur["local_ts"]:
+                conn.execute(
+                    "INSERT OR IGNORE INTO constraints(from_event,to_event,kind,note,created_at) "
+                    "VALUES(?,?,?,?,?)",
+                    (prev["id"], cur["id"], "source_order", "同一来源本地时钟严格有序", now),
+                )
+            prev = cur
 
 
 def reset_all() -> None:
     with db() as conn:
+        conn.execute("DELETE FROM batch_constraints")
+        conn.execute("DELETE FROM batch_events")
+        conn.execute("DELETE FROM batch_sources")
+        conn.execute("DELETE FROM import_batches")
         conn.execute("DELETE FROM constraints")
         conn.execute("DELETE FROM events")
         conn.execute("DELETE FROM sources")

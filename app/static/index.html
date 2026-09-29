@@ -20,6 +20,7 @@
       <input type="file" id="file-input" accept=".json,application/json" hidden>
       ＋ 导入 JSON
     </label>
+    <button class="btn" id="btn-batches">🗂 导入批次</button>
     <button class="btn" id="btn-feasibility">🧭 全局时序可行性</button>
     <button class="btn" id="btn-elapsed">⏳ 耗时审计</button>
     <button class="btn" id="btn-reconcile">🔗 双来源对账</button>
@@ -97,6 +98,23 @@
 </main>
 
 <div id="toast" class="toast hidden"></div>
+
+<!-- 导入批次查看 / 撤回抽屉 -->
+<div id="batches-overlay" class="overlay hidden" aria-hidden="true">
+  <div class="overlay-card">
+    <div class="overlay-head">
+      <h2>🗂 导入批次与撤回</h2>
+      <p class="subtitle">每次 JSON 导入形成一个批次，台账只记录该批次<b>实际写入</b>的来源 / 事件 / 声明约束。
+        撤回仅删除该批次写入且仍存在的记录、保留导入前数据，并重建受影响来源的 <code>source_order</code> 时序边；
+        重复导入未写入的 ID 不会被误删。批次不存在、已撤回或存在无法安全判断归属的记录时会拒绝并说明原因。</p>
+      <div class="overlay-actions">
+        <button class="btn tiny primary" id="batches-rerun">⟳ 刷新</button>
+        <button class="btn tiny ghost" id="batches-close">✕ 关闭</button>
+      </div>
+    </div>
+    <div id="batches-result" class="cmp-result"></div>
+  </div>
+</div>
 
 <!-- 假设方案对比抽屉 -->
 <div id="compare-overlay" class="overlay hidden" aria-hidden="true">
@@ -252,6 +270,7 @@
 </div>
 
 <script src="/static/app.js"></script>
+<script src="/static/batches.js"></script>
 <script src="/static/compare.js"></script>
 <script src="/static/sensitivity.js"></script>
 <script src="/static/feasibility.js"></script>

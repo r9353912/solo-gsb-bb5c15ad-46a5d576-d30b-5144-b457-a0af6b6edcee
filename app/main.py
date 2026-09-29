@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 
 from . import (
     anchor_calibration,
+    batches,
     elapsed_time,
     engine,
     feasibility,
@@ -168,7 +169,7 @@ async def import_events(file: UploadFile = File(...)) -> dict[str, Any]:
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise HTTPException(400, f"JSON 解析失败: {exc}") from exc
     try:
-        summary = import_payload(payload)
+        summary = import_payload(payload, label=file.filename or "")
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     return {"imported": True, "summary": summary}
@@ -181,6 +182,43 @@ def import_raw(payload: Any = Body(...)) -> dict[str, Any]:
         return {"imported": True, "summary": import_payload(payload)}
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+
+
+# ----------------------------------------------------- 导入批次查看 / 撤回
+
+class BatchRetractBody(BaseModel):
+    confirm: bool = False
+
+
+@app.get("/api/batches")
+def batch_list() -> dict[str, Any]:
+    """全部 JSON 导入批次（最新在前），含状态与台账声明的记录数。"""
+    return {"batches": batches.list_batches()}
+
+
+@app.get("/api/batches/{batch_id}")
+def batch_get(batch_id: int) -> dict[str, Any]:
+    """批次详情：本批次新增的来源 / 事件 / 约束，逐项标注当前是否仍存在。"""
+    try:
+        return {"batch": batches.get_batch(batch_id)}
+    except batches.BatchError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@app.post("/api/batches/{batch_id}/retract")
+def batch_retract(batch_id: int, body: BatchRetractBody) -> dict[str, Any]:
+    """撤回批次：confirm=false 只回预案；confirm=true 确认后执行。
+
+    只删除该批次实际写入且仍存在的来源 / 事件 / 声明约束，保留导入前数据，
+    移除批次产生的约束并重建受影响来源的 source_order 边，返回删除 / 保留 /
+    悬空统计。批次不存在、已撤回或存在无法安全判断归属的记录时拒绝。
+    """
+    try:
+        return batches.retract_batch(batch_id, confirm=body.confirm)
+    except batches.BatchError as exc:
+        msg = str(exc)
+        code = 404 if "不存在" in msg else 409
+        raise HTTPException(code, msg) from exc
 
 
 @app.post("/api/recompute")

@@ -414,9 +414,11 @@ async function importFile(file) {
   }
   const data = await res.json();
   const s = data.summary;
-  let msg = `导入完成：新增 ${s.events_added} 事件 / ${s.sources_added} 来源 / ${s.constraints_added} 约束`;
+  let msg = `导入完成（批次 #${s.batch_id}）：新增 ${s.events_added} 事件 / ${s.sources_added} 来源 / ${s.constraints_added} 约束`;
   if (s.rejected.length) msg += `；拒绝 ${s.rejected.length} 条坏记录`;
   if (s.warnings.length) msg += `；${s.warnings.length} 条告警`;
+  if (s.duplicate_event_ids && s.duplicate_event_ids.length)
+    msg += `；${s.duplicate_event_ids.length} 个重复 ID 未写入`;
   toast(msg, s.rejected.length ? "error" : "ok");
   state.overrides = {};
   await Promise.all([loadTypes(), recompute()]);
