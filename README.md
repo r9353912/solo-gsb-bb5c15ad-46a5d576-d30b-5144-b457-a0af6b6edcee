@@ -45,6 +45,13 @@
     判"必超"，**最大 ≤ 阈值**判"必不超"，其余为"可能超"。全局无解时展示现有矛盾
     见证、不输出耗时结论；起终点未知或相同、阈值非法一律明确拒绝。携带页面未保存
     假设、不受筛选影响、只读不写库。
+12. **导入批次查看与撤回**：每按一次 JSON 导入形成一个**批次**，页面（右上
+    **🗂 导入批次**）可逐批查看该批**新增的来源 / 事件 / 约束**，以及因事件 ID 重复、
+    端点悬空、解析被拒而**未写入**的记录。审计员**确认后可整批撤回**：只删除该批
+    **实际写入且仍存在、归属可被安全证明**的记录，保留导入前数据与重复未写入的 ID；
+    自动移除批次产生的约束并按留存事件**重建受影响来源的 source_order 时序边**，
+    返回 **删除 / 保留 / 悬空** 三类统计与逐条明细。归属无法安全判断（行已不属本批）、
+    批次不存在或已撤回时一律**拒绝撤回并说明原因**。
 
 ---
 
@@ -88,6 +95,7 @@ python tests/test_retraction.py  # 纯标准库，覆盖约束撤销建议：最
 python tests/test_reconciliation.py # 纯标准库，覆盖双来源对账：整数毫秒四舍五入 / 闭区间间距 / 全局最优反贪心 / 同优稳定输出 / 200 上限与拒绝
 python tests/test_anchor_calibration.py # 纯标准库，覆盖锚点校准：单对范围 / 闭区间边界 / 多锚点交集 / 冲突上下界锚点 / 漂移固定 / 未保存 offset / 0.5ms 中点 / 重复·失效·来源不一致报错 / 1～20 限制
 python tests/test_elapsed_time.py      # 纯标准库，覆盖两事件耗时审计：精确 min/max（约束收窄朴素差）/ 负界与反向约束 / 环同刻 / 必超·必不超·可能超（闭端点）/ 全量见证可行 / 全局无解无结论 / 未知·相同事件·非法阈值 / 未保存假设 / 只读 / 5000 事件
+python tests/test_batches.py           # 纯标准库，覆盖导入批次与安全撤回：批次账本 / 重复跳过 / 悬空端点 / 只删本批 / 重复 ID 不误删 / source_order 重建与归属去污 / 来源保留 / 外部约束悬空 / 不存在·已撤回·未确认·归属冲突拒绝 / 撤回后再导入 / 旧库迁移
 ```
 
 ---
@@ -282,6 +290,44 @@ python tests/test_elapsed_time.py      # 纯标准库，覆盖两事件耗时审
 
 ---
 
+## 导入批次查看与撤回（🗂）
+
+审计实践中常需要"把上一次导入的那一份 JSON 整体撤回，但别动更早的数据"。点右上
+**🗂 导入批次**（API：`GET /api/batches`、`GET /api/batches/{id}`、
+`POST /api/batches/{id}/retract`）：
+
+1. **每一次导入（文件上传 / `/api/import/raw` / 空库示例载入）都形成一个批次**，
+   内含案件名、文件名、时间、新增计数，以及逐条账本：
+   - `written`：该批实际写入的来源 / 事件 / 约束（行上同时带 `import_batch_id` 归属戳）；
+   - `skipped`：**因事件 ID 重复而未写入**、文件内重复、**约束端点悬空**、**解析被拒**
+     的记录及原因——这些 ID 在撤回时**绝不删除**。
+2. **确认后撤回**：在批次明细内点"🗑 确认撤回批次"，浏览器二次确认后才提交
+   `{"confirm": true}`。撤回在**单事务**内完成，原则是**只删该批实际写入且仍存在、
+   归属可安全证明的记录**：
+   - **归属交叉验证**：以账本 `written` 项为准，并用行上的归属戳复核。戳为 NULL
+     （批次功能上线前的存量数据 / 页面手工数据）或指向别的批次（归属被改动）时
+     **拒绝撤回并逐条说明"无法安全判断归属"**，绝不猜测删除；
+   - **来源保留**：批次引入的来源若仍被其它（导入前已有 / 后续批次）事件使用，
+     删除会连带破坏非本批数据，则**保留**该来源并计入 retained；
+   - **source_order 重建**：移除所有触及本批事件的系统时序边，再对每个受影响来源
+     按其**留存事件**重建（恢复为导入前数据自己生成的边）；
+   - **外部约束悬空**：非本批写入的人工/导入约束若引用了被删事件，**保留该约束**
+     （其端点随后不存在，成为悬空约束），计入 dangling 并逐条列出；引擎与全局
+     可行性检查本就跳过悬空边，审计员可随后到右栏手动处理；
+   - 账本中 `written` 但行已在批次外被删除的记录计入 dangling（曾经写入、现已不在）。
+3. **返回统计**：`deleted`（来源 / 事件 / 人工约束 / 移除并重建的 source_order 边数）、
+   `retained`（被复用的来源等）、`dangling`（批次外已删项 + 成为悬空的外部约束）
+   三类计数及明细，并给出一句话汇总；批次标记为 `retracted`，**不能重复撤回**。
+4. **错误语义**：批次不存在 → 404；已撤回 / 含无法安全判断归属的记录 → 409；
+   未带 `confirm=true` → 400。撤回被拒绝时不删除任何数据。
+5. **撤回后可重新导入**：被撤回的事件 ID 可再次导入（新批次、新归属戳），互不影响；
+   批次自增 ID 永不复用，账本（`batch_items`）在撤回后保留为审计轨迹。
+
+> 旧版本数据库（无批次表 / 归属列）首次启动时自动平滑加列升级；存量行归属戳为
+> NULL，因此对这些数据发起批次撤回会按"无法安全判断归属"安全拒绝。
+
+---
+
 ## 输入 JSON 格式
 
 顶层对象（也接受直接的事件数组）：
@@ -408,6 +454,11 @@ gap ∈ [ lo_b - hi_a ,  hi_b - lo_a ]
   分别给出达到端点的全量事件时刻见证（分批渲染、可点击定位），附朴素两区间差对照与
   起终点约束路径方向说明；全局无解时展示矛盾见证、不给耗时结论；事件未知 / 相同 /
   阈值非法明确拒绝；只读，不保存假设或改写数据。
+- **导入批次**（右上 🗂）：按每次 JSON 导入形成的批次查看新增来源 / 事件 / 约束与未写入
+  （重复 ID / 悬空端点 / 被拒）记录；确认后整批撤回——只删该批实际写入且仍存在、
+  归属可安全证明的记录，保留导入前数据与重复未写入的 ID，自动移除批次约束并重建受影响
+  来源的 source_order 边，返回删除 / 保留 / 悬空统计；批次不存在、已撤回或含无法安全
+  判断归属的记录时拒绝撤回并说明原因。
 
 ---
 
@@ -415,8 +466,11 @@ gap ∈ [ lo_b - hi_a ,  hi_b - lo_a ]
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| POST | `/api/import` | multipart 上传 JSON 文件 |
-| POST | `/api/import/raw` | 直接提交 JSON（便于 curl / 集成） |
+| POST | `/api/import` | multipart 上传 JSON 文件（形成导入批次） |
+| POST | `/api/import/raw` | 直接提交 JSON（形成导入批次，便于 curl / 集成） |
+| GET | `/api/batches` | 导入批次列表（最近优先，含写入/跳过计数） |
+| GET | `/api/batches/{id}` | 查看批次：新增来源/事件/约束 + 未写入（跳过）明细 |
+| POST | `/api/batches/{id}/retract` | 确认撤回批次（body `{"confirm":true}`）：只删本批写入且归属可验证的记录，重建 source_order，返回删除/保留/悬空统计；不存在 404、已撤回/归属冲突 409、未确认 400 |
 | POST | `/api/recompute` | 应用临时假设 + 筛选条件，返回完整推理结果 |
 | POST | `/api/sources/assumptions` | 持久化审计员确认的偏差假设 |
 | GET | `/api/sources` | 来源列表（含生效值 / 已存值 / dirty 标记） |
@@ -864,11 +918,12 @@ curl -X POST http://localhost:8000/api/elapsed-time-bounds \
 │   ├── elapsed_time.py     # 两事件耗时审计：SCC 压缩 DAG 上分量最早/最晚 + 端点钉扎传播，求 t_end−t_start 精确 min/max 与全量见证（只读）
 │   ├── scenarios.py     # 命名假设方案快照 CRUD、双方案重算差异（冲突/歧义/边/时间线/参数）
 │   ├── sensitivity.py   # 偏移敏感性：临界点解析求解、稳定区间切分、逐段重算与差异配对
-│   ├── importer.py      # 多别名宽松 JSON 规范化、幂等入库、来源时序边重建
-│   ├── db.py            # SQLite 连接、建表初始化（含 scenarios 表）
+│   ├── importer.py      # 多别名宽松 JSON 规范化、幂等入库、来源时序边重建、批次登记与账本
+│   ├── batches.py       # 导入批次查看与安全撤回：账本×归属戳交叉验证、source_order 重建、删除/保留/悬空统计
+│   ├── db.py            # SQLite 连接、建表初始化（含 scenarios / import_batches / batch_items 表与旧库加列迁移）
 │   ├── timeutil.py      # 多格式时间戳解析（秒/毫秒/微秒/纳秒、ISO、RFC2822）
 │   ├── sample.py        # 内置示例案件
-│   └── static/          # 原生前端 index.html / style.css / app.js / compare.js / sensitivity.js / feasibility.js / retraction.js / reconciliation.js / elapsed.js
+│   └── static/          # 原生前端 index.html / style.css / app.js / compare.js / sensitivity.js / feasibility.js / retraction.js / reconciliation.js / elapsed.js / batches.js
 ├── examples/login-anomaly.json
 ├── tests/test_engine.py      # 纯标准库测试（11 项）
 ├── tests/test_scenarios.py   # 方案快照与双方案对比测试（12 项）
@@ -878,6 +933,7 @@ curl -X POST http://localhost:8000/api/elapsed-time-bounds \
 ├── tests/test_reconciliation.py # 双来源事件对账测试（22 项：舍入/闭区间/反贪心/同优稳定/上限拒绝/未保存假设）
 ├── tests/test_anchor_calibration.py # 锚点校准测试（21 项：单对范围/闭区间边界/交集/冲突锚点/漂移固定/未保存 offset/0.5ms 中点/重复·失效·来源不一致/1～20 限制）
 ├── tests/test_elapsed_time.py # 两事件耗时审计测试（20 项：精确 min/max/朴素对照/负界/环同刻/三态闭端点/全量见证/无解无结论/入参拒绝/未保存假设/只读/5000 事件）
+├── tests/test_batches.py      # 导入批次与安全撤回测试（16 项：账本/重复跳过/只删本批/重复 ID 不误删/source_order 重建/来源保留/外部悬空/不存在·已撤回·未确认·归属冲突拒绝/旧库迁移）
 ├── docker/entrypoint.sh # 启动钩子：初始化数据库后拉起 uvicorn
 ├── Dockerfile
 ├── docker-compose.yml

@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 
 from . import (
     anchor_calibration,
+    batches,
     elapsed_time,
     engine,
     feasibility,
@@ -29,7 +30,7 @@ STATIC_DIR = BASE_DIR / "static"
 app = FastAPI(
     title="事件证据链审计台",
     description="导入多来源 JSON 事件记录，校正时钟偏差，重建可解释时间线并定位冲突链。",
-    version="1.7.0",
+    version="1.8.0",
 )
 
 
@@ -168,7 +169,7 @@ async def import_events(file: UploadFile = File(...)) -> dict[str, Any]:
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise HTTPException(400, f"JSON 解析失败: {exc}") from exc
     try:
-        summary = import_payload(payload)
+        summary = import_payload(payload, filename=file.filename or "")
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     return {"imported": True, "summary": summary}
@@ -180,6 +181,46 @@ def import_raw(payload: Any = Body(...)) -> dict[str, Any]:
     try:
         return {"imported": True, "summary": import_payload(payload)}
     except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+# ----------------------------------------------------- 导入批次查看与撤回
+
+class BatchRetractBody(BaseModel):
+    confirm: bool = False
+
+
+@app.get("/api/batches")
+def batch_list() -> dict[str, Any]:
+    """列出所有导入批次（最近优先），含写入/跳过计数。"""
+    return {"batches": batches.list_batches()}
+
+
+@app.get("/api/batches/{batch_id}")
+def batch_get(batch_id: int) -> dict[str, Any]:
+    """查看单个批次的新增来源 / 事件 / 约束与未写入（跳过）明细。"""
+    try:
+        return {"batch": batches.get_batch(batch_id)}
+    except batches.BatchNotFound as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@app.post("/api/batches/{batch_id}/retract")
+def batch_retract(batch_id: int, body: BatchRetractBody) -> dict[str, Any]:
+    """确认后撤回一个导入批次。
+
+    只删除该批次实际写入且仍存在、归属可安全证明的记录，保留导入前数据；
+    移除批次产生的约束、重建受影响来源的 source_order 边，返回
+    删除 / 保留 / 悬空统计。批次不存在 → 404；已撤回、未确认或含无法
+    安全判断归属的记录 → 409/400 并说明原因。
+    """
+    try:
+        return batches.retract_batch(batch_id, confirm=body.confirm)
+    except batches.BatchNotFound as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except batches.BatchConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except batches.BatchError as exc:
         raise HTTPException(400, str(exc)) from exc
 
 
@@ -266,6 +307,14 @@ def delete_source(source_id: str) -> dict[str, Any]:
         cur = conn.execute("DELETE FROM sources WHERE id=?", (source_id,))
         if cur.rowcount == 0:
             raise HTTPException(404, "来源不存在")
+        # 级联删除事件后，清理端点已不存在的悬空 source_order 边
+        # （人工约束的悬空由引擎/可行性检查跳过，保留以便审计追溯）。
+        conn.execute(
+            "DELETE FROM constraints WHERE kind='source_order' AND "
+            "from_event NOT IN (SELECT id FROM events)")
+        conn.execute(
+            "DELETE FROM constraints WHERE kind='source_order' AND "
+            "to_event NOT IN (SELECT id FROM events)")
     return {"deleted": source_id}
 
 

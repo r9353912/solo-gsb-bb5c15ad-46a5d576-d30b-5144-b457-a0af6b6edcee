@@ -98,7 +98,59 @@ CREATE TABLE IF NOT EXISTS scenarios (
     created_at   TEXT NOT NULL,
     updated_at   TEXT NOT NULL
 );
+
+-- 一次 JSON 导入形成一个批次；撤回只允许针对 active 批次。
+CREATE TABLE IF NOT EXISTS import_batches (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    case_ref      TEXT NOT NULL DEFAULT '',  -- 导入文档中的 case（可空）
+    filename      TEXT NOT NULL DEFAULT '',  -- 上传文件名（/api/import/raw 为空）
+    status        TEXT NOT NULL DEFAULT 'active', -- active | retracted
+    created_at    TEXT NOT NULL,
+    retracted_at  TEXT,
+    sources_added INTEGER NOT NULL DEFAULT 0,
+    events_added  INTEGER NOT NULL DEFAULT 0,
+    constraints_added INTEGER NOT NULL DEFAULT 0,
+    rejected_count INTEGER NOT NULL DEFAULT 0,
+    warning_count  INTEGER NOT NULL DEFAULT 0,
+    note          TEXT NOT NULL DEFAULT ''
+);
+
+-- 批次账本：逐条登记该批次“实际写入（written）”与“因重复/拒绝而未写入（skipped）”
+-- 的来源 / 事件 / 约束。撤回时只动 written 项，并用行上的 import_batch_id
+-- 交叉验证归属；skipped 的重复 ID 永不被本批次撤回误删。
+CREATE TABLE IF NOT EXISTS batch_items (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id   INTEGER NOT NULL REFERENCES import_batches(id) ON DELETE CASCADE,
+    item_type  TEXT NOT NULL,                -- source | event | constraint
+    ref_id     TEXT NOT NULL,                -- 来源/事件为业务 ID，约束为自增 id（字符串保存）
+    status     TEXT NOT NULL,                -- written | skipped
+    reason     TEXT NOT NULL DEFAULT '',     -- skipped 原因（duplicate / rejected / dangling_endpoint ...）
+    detail     TEXT NOT NULL DEFAULT '{}',   -- 快照 JSON：端点/类型等，便于页面展示
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_batch_items_batch ON batch_items(batch_id, item_type, status);
 """
+
+# 旧库升级：给三张实体表补归属戳。NULL 表示“批次功能上线前的存量数据 / 页面手工数据”，
+# 撤回时无法安全证明归属，按“无法安全判断归属”拒绝而不是删除。
+_MIGRATIONS = (
+    "ALTER TABLE sources ADD COLUMN import_batch_id INTEGER",
+    "ALTER TABLE events ADD COLUMN import_batch_id INTEGER",
+    "ALTER TABLE constraints ADD COLUMN import_batch_id INTEGER",
+)
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    have = {r["name"] for r in conn.execute(
+        "SELECT name FROM pragma_table_info('sources')")}
+    # 任意一张新列缺失即按顺序补齐（ALTER 只支持逐列添加）。
+    if "import_batch_id" not in have:
+        for stmt in _MIGRATIONS:
+            conn.execute(stmt)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_events_batch ON events(import_batch_id)")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_constraints_batch ON constraints(import_batch_id)")
 
 
 def init_db(load_sample: bool | None = None) -> None:
@@ -106,6 +158,7 @@ def init_db(load_sample: bool | None = None) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     with db() as conn:
         conn.executescript(SCHEMA)
+        _migrate(conn)
         conn.execute(
             "INSERT INTO meta(key, value) VALUES('initialized_at', ?) "
             "ON CONFLICT(key) DO NOTHING",

@@ -6,6 +6,17 @@
 
 字段名做宽松别名映射（time/ts/timestamp、source/src、type/kind ...），
 无法解析的时间戳会被拒绝并在 summary.rejected 中说明，不会静默入库。
+
+批次（batch）
+------------
+每次导入形成一个**批次**（import_batches 一行 + batch_items 账本）：
+- 实际写入的来源 / 事件 / 约束记 ``status='written'``，行上同时打
+  ``import_batch_id`` 归属戳；
+- 因事件 ID 重复而**未写入**的记录记 ``status='skipped'``（reason=duplicate），
+  撤回该批次时这些 ID 绝不能被误删；
+- 解析被拒 / 端点悬空的记录同样只进账本 skipped，不影响库内数据。
+
+撤回由 ``app.batches`` 实现；本模块只负责如实记账。
 """
 from __future__ import annotations
 
@@ -61,21 +72,23 @@ def _normalize_source(raw: dict) -> dict:
     }
 
 
-def _upsert_source(conn, s: dict, warnings: list[str]) -> None:
+def _upsert_source(conn, s: dict, batch_id: int, warnings: list[str]) -> bool:
+    """插入新来源并打批次戳；已存在则只补名称。返回是否为本次新增。"""
     row = conn.execute("SELECT id, name FROM sources WHERE id=?", (s["id"],)).fetchone()
     now = _now()
     if row is None:
         conn.execute(
             "INSERT INTO sources(id,name,clock_offset,drift_ppm,uncertainty,reliability,kind,"
-            "created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+            "created_at,updated_at,import_batch_id) VALUES(?,?,?,?,?,?,?,?,?,?)",
             (s["id"], s["name"], s["clock_offset"], s["drift_ppm"], s["uncertainty"],
-             s["reliability"], s["kind"], now, now),
+             s["reliability"], s["kind"], now, now, batch_id),
         )
-    else:
-        # 已存在的来源（审计员可能已调整偏差假设）：不覆盖假设，只补名称。
-        if not row["name"] and s["name"]:
-            conn.execute("UPDATE sources SET name=?, updated_at=? WHERE id=?",
-                         (s["name"], now, s["id"]))
+        return True
+    # 已存在的来源（审计员可能已调整偏差假设）：不覆盖假设，只补名称。
+    if not row["name"] and s["name"]:
+        conn.execute("UPDATE sources SET name=?, updated_at=? WHERE id=?",
+                     (s["name"], now, s["id"]))
+    return False
 
 
 # ----------------------------------------------------------------- events
@@ -133,8 +146,12 @@ def _normalize_constraint(raw: dict) -> tuple[tuple | None, str | None]:
 
 # ------------------------------------------------------------------ 入口
 
-def import_payload(payload: Any) -> dict[str, Any]:
-    """导入一份 JSON 文档，返回 {sources_added, events_imported, rejected, warnings}。"""
+def import_payload(payload: Any, filename: str = "") -> dict[str, Any]:
+    """导入一份 JSON 文档并登记批次。
+
+    返回 {batch_id, sources_total, sources_added, events_total, events_added,
+          constraints_added, rejected, warnings}。
+    """
     warnings: list[str] = []
     rejected: list[dict] = []
 
@@ -143,6 +160,7 @@ def import_payload(payload: Any) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError("顶层必须是对象或事件数组")
 
+    case_ref = str(payload.get("case", "") or "")
     raw_sources = payload.get("sources", []) or []
     if isinstance(raw_sources, dict):  # 允许 {"gateway": {...}}
         raw_sources = [{"id": k, **(v if isinstance(v, dict) else {})}
@@ -178,7 +196,23 @@ def import_payload(payload: Any) -> dict[str, Any]:
 
     now = _now()
     with db() as conn:
-        known_before = {r["id"] for r in conn.execute("SELECT id FROM sources")}
+        batch_id = conn.execute(
+            "INSERT INTO import_batches(case_ref,filename,status,created_at,"
+            "rejected_count,warning_count) VALUES(?,?, 'active', ?,?,?)",
+            (case_ref, filename, now, len(rejected), len(warnings)),
+        ).lastrowid
+
+        def ledger(item_type: str, ref_id: str, status: str,
+                   reason: str = "", detail: dict | None = None) -> None:
+            conn.execute(
+                "INSERT INTO batch_items(batch_id,item_type,ref_id,status,reason,detail,"
+                "created_at) VALUES(?,?,?,?,?,?,?)",
+                (batch_id, item_type, str(ref_id), status, reason,
+                 json.dumps(detail or {}, ensure_ascii=False), now),
+            )
+
+        known_before = {r["id"]: r for r in conn.execute(
+            "SELECT id, import_batch_id FROM sources")}
         known_events = {r["id"] for r in conn.execute("SELECT id FROM events")}
 
         # 事件里出现但未声明的来源：自动登记，偏差假设留待审计员修正。
@@ -194,41 +228,89 @@ def import_payload(payload: Any) -> dict[str, Any]:
 
         sources_added = 0
         for s in sources:
-            if s["id"] not in known_before:
+            if s["id"] in known_before:
+                ledger("source", s["id"], "skipped", "duplicate",
+                       {"name": s["name"], "kind": s["kind"]})
+                _upsert_source(conn, s, batch_id, warnings)
+                continue
+            if _upsert_source(conn, s, batch_id, warnings):
                 sources_added += 1
-            _upsert_source(conn, s, warnings)
+                ledger("source", s["id"], "written", "",
+                       {"name": s["name"], "kind": s["kind"],
+                        "clock_offset": s["clock_offset"],
+                        "drift_ppm": s["drift_ppm"],
+                        "uncertainty": s["uncertainty"],
+                        "reliability": s["reliability"]})
 
         events_added = 0
+        seen_in_batch: set[str] = set()
         for ev in events:
             if ev["id"] in known_events:
+                ledger("event", ev["id"], "skipped", "duplicate",
+                       {"source_id": ev["source_id"], "event_type": ev["event_type"],
+                        "summary": ev["summary"]})
                 continue  # 幂等：重复导入不覆盖
+            if ev["id"] in seen_in_batch:
+                # 同一文件内自身重复：第一条已写入，后续走唯一约束，记 skipped。
+                ledger("event", ev["id"], "skipped", "duplicate_in_batch",
+                       {"source_id": ev["source_id"], "event_type": ev["event_type"],
+                        "summary": ev["summary"]})
+                continue
             conn.execute(
-                "INSERT INTO events(id,source_id,seq,local_ts,ts_text,event_type,actor,summary,raw,"
-                "imported_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO events(id,source_id,seq,local_ts,ts_text,event_type,actor,summary,"
+                "raw,imported_at,import_batch_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 (ev["id"], ev["source_id"], ev["seq"], ev["local_ts"], ev["ts_text"],
                  ev["event_type"], ev["actor"], ev["summary"],
-                 json.dumps(ev["raw"], ensure_ascii=False), now),
+                 json.dumps(ev["raw"], ensure_ascii=False), now, batch_id),
             )
+            seen_in_batch.add(ev["id"])
             events_added += 1
+            ledger("event", ev["id"], "written", "",
+                   {"source_id": ev["source_id"], "event_type": ev["event_type"],
+                    "actor": ev["actor"], "summary": ev["summary"],
+                    "local_ts": ev["local_ts"], "ts_text": ev["ts_text"]})
+
+        # 解析被拒事件也入账本（仅用于审计追溯，撤回时不会动任何库内行）。
+        for rj in rejected:
+            ledger("event", rj.get("raw", "")[:80], "skipped", "rejected",
+                   {"reason": rj.get("reason", "")})
 
         # 重建“同来源时序边”：同来源事件天然按本地时钟严格有序。
-        _rebuild_source_edges(conn, now)
+        _rebuild_source_edges(conn, now, batch_id)
 
         # 用户/外部声明的约束（端点必须存在，悬空则报警）。
         constraints_added = 0
+        event_ids_now = known_events | seen_in_batch
         for frm, to, kind, note in constraints:
-            if frm not in known_events and not any(e["id"] == frm for e in events):
+            detail = {"from": frm, "to": to, "kind": kind, "note": note}
+            if frm not in event_ids_now:
                 warnings.append(f"约束引用了不存在的事件 {frm}")
+                ledger("constraint", f"{frm}->{to}/{kind}", "skipped",
+                       "dangling_endpoint", detail)
                 continue
-            if to not in known_events and not any(e["id"] == to for e in events):
+            if to not in event_ids_now:
                 warnings.append(f"约束引用了不存在的事件 {to}")
+                ledger("constraint", f"{frm}->{to}/{kind}", "skipped",
+                       "dangling_endpoint", detail)
                 continue
             cur = conn.execute(
-                "INSERT OR IGNORE INTO constraints(from_event,to_event,kind,note,created_at) "
-                "VALUES(?,?,?,?,?)", (frm, to, kind, note, now))
-            constraints_added += cur.rowcount
+                "INSERT OR IGNORE INTO constraints(from_event,to_event,kind,note,created_at,"
+                "import_batch_id) VALUES(?,?,?,?,?,?)", (frm, to, kind, note, now, batch_id))
+            if cur.rowcount:
+                constraints_added += 1
+                ledger("constraint", str(cur.lastrowid), "written", "", detail)
+            else:
+                ledger("constraint", f"{frm}->{to}/{kind}", "skipped", "duplicate", detail)
+
+        conn.execute(
+            "UPDATE import_batches SET sources_added=?, events_added=?, "
+            "constraints_added=?, rejected_count=?, warning_count=? WHERE id=?",
+            (sources_added, events_added, constraints_added,
+             len(rejected), len(warnings), batch_id),
+        )
 
     return {
+        "batch_id": batch_id,
         "sources_total": len(sources),
         "sources_added": sources_added,
         "events_total": len(events),
@@ -239,23 +321,53 @@ def import_payload(payload: Any) -> dict[str, Any]:
     }
 
 
-def _rebuild_source_edges(conn, now: str) -> None:
-    """为每个来源按 (seq 优先, 否则 local_ts) 生成严格时序边。"""
-    conn.execute("DELETE FROM constraints WHERE kind='source_order'")
-    rows = conn.execute("SELECT id, source_id, seq, local_ts FROM events").fetchall()
+def _rebuild_source_edges(conn, now: str, batch_id: int | None = None,
+                          only_sources: set[str] | None = None) -> int:
+    """为每个来源按 (seq 优先, 否则 local_ts) 生成严格时序边。
+
+    全量重建（导入时）：删除全部 source_order 后重插，新边打本次批次戳。
+    定向重建（撤回后恢复受影响来源）：只处理 only_sources 中的来源；这些
+    来源的事件集已回到导入前状态，其 source_order 边必须恢复成“导入前数据
+    自己的边”，因此重插时归属戳置 NULL（系统派生，不属于任何可撤回批次）。
+    返回重建的边数。
+    """
+    if only_sources is not None:
+        if not only_sources:
+            return 0
+        placeholders = ",".join("?" for _ in only_sources)
+        conn.execute(
+            "DELETE FROM constraints WHERE kind='source_order' AND "
+            f"(from_event IN (SELECT id FROM events WHERE source_id IN ({placeholders})) "
+            f"OR to_event IN (SELECT id FROM events WHERE source_id IN ({placeholders})))",
+            (*only_sources, *only_sources),
+        )
+        rows = conn.execute(
+            f"SELECT id, source_id, seq, local_ts FROM events "
+            f"WHERE source_id IN ({placeholders})",
+            tuple(only_sources),
+        ).fetchall()
+        stamp = None
+    else:
+        conn.execute("DELETE FROM constraints WHERE kind='source_order'")
+        rows = conn.execute("SELECT id, source_id, seq, local_ts FROM events").fetchall()
+        stamp = batch_id
+
     by_source: dict[str, list] = {}
     for r in rows:
         by_source.setdefault(r["source_id"], []).append(r)
+    count = 0
     for evs in by_source.values():
         evs.sort(key=lambda r: (r["seq"] if r["seq"] is not None else 1 << 62, r["local_ts"]))
         for a, b in zip(evs, evs[1:]):
             if a["local_ts"] == b["local_ts"]:
                 continue  # 同刻戳无法声明严格顺序
             conn.execute(
-                "INSERT OR IGNORE INTO constraints(from_event,to_event,kind,note,created_at) "
-                "VALUES(?,?,?,?,?)",
-                (a["id"], b["id"], "source_order", "同一来源本地时钟严格有序", now),
+                "INSERT OR IGNORE INTO constraints(from_event,to_event,kind,note,created_at,"
+                "import_batch_id) VALUES(?,?,?,?,?,?)",
+                (a["id"], b["id"], "source_order", "同一来源本地时钟严格有序", now, stamp),
             )
+            count += 1
+    return count
 
 
 def reset_all() -> None:
@@ -264,3 +376,5 @@ def reset_all() -> None:
         conn.execute("DELETE FROM events")
         conn.execute("DELETE FROM sources")
         conn.execute("DELETE FROM scenarios")
+        conn.execute("DELETE FROM batch_items")
+        conn.execute("DELETE FROM import_batches")
